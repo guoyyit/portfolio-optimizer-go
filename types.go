@@ -82,6 +82,7 @@ const (
 	StatusInfeasible                 // constraints are mutually inconsistent
 	StatusTimeout                    // time budget exhausted; best feasible point returned
 	StatusInvalidInput               // malformed inputs
+	StatusAbandoned                  // no valid rebalancing action could be taken; current weights returned
 )
 
 func (s Status) String() string {
@@ -96,6 +97,8 @@ func (s Status) String() string {
 		return "timeout"
 	case StatusInvalidInput:
 		return "invalid-input"
+	case StatusAbandoned:
+		return "abandoned"
 	default:
 		return "unknown"
 	}
@@ -115,6 +118,9 @@ const (
 	DiagTurnoverCapped     DiagFlag = "turnover-capped"
 	DiagNoTradeZone        DiagFlag = "no-trade-zone"
 	DiagUnstable           DiagFlag = "unstable-allocation"
+	DiagTradesReclosed     DiagFlag = "trades-reclosed"
+	DiagRebalanceAbandoned DiagFlag = "rebalance-abandoned"
+	DiagInvalidResult      DiagFlag = "invalid-result"
 )
 
 // Diagnostic is a machine-readable, human-explainable finding.

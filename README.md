@@ -60,10 +60,51 @@
 
 `Rebalance` 给定当前/目标权重、比例交易成本、换手上限与无交易带：
 
-1. 小于 `NoTradeBand` 的交易被抑制（避免无意义调仓）；
-2. 超出 `MaxTurnover` 时交易按比例缩放（部分再平衡，`StatusSuboptimal`）；
-3. 成本-收益闸门：收益（对目标的跟踪误差下降，无估计时为 L1 距离下降）
-   不超过 `MinBenefit × 成本` 时放弃调仓，`Reason` 字段给出可解释说明。
+1. **最小调仓阈值（抑制）**：某资产目标调仓量（或经重配平/换手缩放后的
+   有效调仓量）满足 `|trade| < NoTradeBand` 时被抑制，该资产保持当前权重。
+2. **重配平（预算闭合）**：抑制会打破“买入总额 = 卖出总额”。算法对较大
+   的一侧（全部买单或全部卖单）按同一系数等比缩小，使两侧重新相等，从而
+   保证 `Σnew = 1`。缩放只减小调仓量、永不改变方向，因此不会越过目标。
+   重配平或换手缩放可能使更多资产跌破阈值，这些资产被再次抑制并重新配平
+   （每轮至少剔除一个资产，最多 n 轮收敛）。
+3. **换手上限**：重配平后的方案若 `Σ|trade| > MaxTurnover`，全部交易按
+   同一系数缩放到上限；缩放保留闭合关系。缩放后若产生低于阈值的交易，
+   回到第 2 步级联处理，因此不会借缩放绕过阈值，也不会借重配平绕过换手上限。
+4. **成本-收益闸门**：收益（对目标的跟踪误差下降；无估计时为 L1 距离下降）
+   不大于 0，或不超过 `MinBenefit × 成本` 时放弃调仓。
+
+### 返回状态与出口语义
+
+| 状态 | 触发条件 | 权重/交易 |
+|---|---|---|
+| `StatusOptimal` | 已在目标点；或无需抑制/未触发换手上限即可执行 | `new = current + trades`，和为 1 |
+| `StatusSuboptimal` | 部分执行：有资产被阈值抑制并重配平，或换手上限绑定 | 新权重和为 1；被抑制资产保持当前权重 |
+| `StatusAbandoned` | 全部目标调仓都低于阈值；重配平后某一侧完全消失；换手缩放后无任何满足阈值的交易；成本-收益闸门放弃 | 零交易，`new = current`，换手与成本均为 0 |
+| `StatusInvalidInput` | 非法输入（见下），伴随可区分 error | 不返回权重 |
+
+每次结果的 `Reason` 说明：哪些资产因阈值未调仓（逐资产诊断）、剩余买单/
+卖单以何系数重配平、换手是否绑定及缩放比例、实际换手
+`Turnover = Σ|trade|` 与成本 `Cost = Σ buy·BuyCost + Σ sell·SellCost` 的
+计算口径、以及闸门放弃的收益/成本对比。相关诊断标志：
+`DiagNoTradeZone`（逐资产抑制 / 闸门）、`DiagTradesReclosed`（重配平）、
+`DiagTurnoverCapped`（换手上限绑定）、`DiagRebalanceAbandoned`（完全放弃）。
+
+### 输入校验与最终结果校验
+
+输入被明确拒绝（`StatusInvalidInput` + 可区分 error）的情形：当前与目标
+长度不一致或为空；权重或估计含 NaN/±Inf；当前或目标权重和在
+`1e-9·n` 容差内不等于 1；`NoTradeBand`、`MaxTurnover`、`MinBenefit` 或
+买卖成本率为负/非有限；估计维度不匹配。
+
+**所有携带权重的返回路径**（含完全放弃）都经过统一的最终校验：权重和为 1、
+长度与有限性、`new = current + trades`、每笔交易方向朝向目标、非零交易不
+低于阈值、换手不超上限、换手/成本字段与交易一致、放弃出口严格等于当前
+权重。任一条件不满足时返回 `StatusInfeasible` 与哨兵错误
+`ErrInvalidRebalanceResult`（附 `DiagInvalidResult` 诊断），绝不静默返回
+权重和不为 1 或违反约束的结果。
+
+`Rebalance` 是纯函数：不修改请求（内部使用副本）、无共享可变状态，可安全
+并发调用；相同输入逐位一致。
 
 ## 稳健性诊断
 
@@ -122,7 +163,9 @@ rb, _ := portfolio.Rebalance(ctx, portfolio.RebalanceRequest{
 
 `DiagMissingData`、`DiagOutliersWinsorized`、`DiagHighDimensional`
 （资产数 > 样本数）、`DiagShrinkageApplied`、`DiagEigenvalueClipped`、
-`DiagNearSingular`、`DiagTurnoverCapped`、`DiagNoTradeZone`、`DiagUnstable`。
+`DiagNearSingular`、`DiagTurnoverCapped`、`DiagNoTradeZone`、
+`DiagTradesReclosed`、`DiagRebalanceAbandoned`、`DiagInvalidResult`、
+`DiagUnstable`。
 
 ## 测试
 
@@ -132,4 +175,7 @@ go test -race ./...  # 并发竞争检测
 ```
 
 覆盖：约束边界、奇异/近奇异协方差、缺失与异常值、n>p、换手率上限、
-逐位确定性、并发安全（-race）、参数扰动稳定性。
+再平衡的单边/多边（同向与反向）阈值抑制、重配平闭合、阈值与换手上限
+叠加（部分执行与完全放弃）、成本-收益闸门放弃、所有返回路径的权重和与
+约束校验、非法输入的可区分拒绝、逐位确定性、并发安全（-race）、
+参数扰动稳定性。
