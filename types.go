@@ -115,6 +115,11 @@ const (
 	DiagTurnoverCapped     DiagFlag = "turnover-capped"
 	DiagNoTradeZone        DiagFlag = "no-trade-zone"
 	DiagUnstable           DiagFlag = "unstable-allocation"
+	// DiagRebalanceAbandoned marks a rebalance request that executed no
+	// trades at all (all trades suppressed, the budget could not be
+	// re-closed within the no-trade band, or the cost/benefit gate fired);
+	// NewWeights then equal CurrentWeights.
+	DiagRebalanceAbandoned DiagFlag = "rebalance-abandoned"
 )
 
 // Diagnostic is a machine-readable, human-explainable finding.

@@ -60,10 +60,53 @@
 
 `Rebalance` 给定当前/目标权重、比例交易成本、换手上限与无交易带：
 
-1. 小于 `NoTradeBand` 的交易被抑制（避免无意义调仓）；
-2. 超出 `MaxTurnover` 时交易按比例缩放（部分再平衡，`StatusSuboptimal`）；
-3. 成本-收益闸门：收益（对目标的跟踪误差下降，无估计时为 L1 距离下降）
-   不超过 `MinBenefit × 成本` 时放弃调仓，`Reason` 字段给出可解释说明。
+目标调仓量为 `delta = target - current`。初始时 Σdelta = 0（全额投资），
+但抑制小笔交易会破坏闭合，因此解析过程保证**返回权重之和在 1e-9 容差内
+严格等于 1**：
+
+1. **最小调仓阈值（`NoTradeBand`）**：`|delta_i| < band` 的资产保持当前
+   权重、不调仓。抑制产生的买卖缺口通过**裁剪较大的一侧**消除（只减不增、
+   绝不越过目标）：即把买入总额或卖出总额缩小到与另一侧相等。被裁剪一侧
+   的各笔交易按同比例缩小，因此 Σtrades = 0、权重重新闭合。裁剪后若有新的
+   交易低于阈值，会被级联抑制并重新配平，直到所有执行的交易都 `>= band`。
+2. **换手上限（`MaxTurnover`）**：换手定义为 Σ|trades|（= 买入总额 + 卖出
+   总额 = 2×min(买入, 卖出)）。闭合后的换手超出上限时，所有交易同向等比
+   缩放，缩放可能再次把某些交易推入阈值内而触发上一步的级联抑制；缩放与
+   级联迭代进行，最终结果同时满足阈值、闭合与上限，不会通过重配平绕过
+   任何一条规则。
+3. **成本-收益闸门（`MinBenefit`）**：收益（对目标的跟踪误差下降，无估计
+   时为 L1 距离下降）不超过 `MinBenefit × 实际执行成本`，或收益非正时，
+   放弃调仓。成本按实际执行的换手逐笔计算（买入 × `BuyCost`、卖出 ×
+   `SellCost`），放弃时成本为 0。
+
+### 退出状态
+
+| 情形 | 状态 | 权重 / 交易 | 诊断 |
+|---|---|---|---|
+| 全部资产直达目标（或本就在目标） | `StatusOptimal` | 新权重 = 目标；无抑制 | — |
+| 有抑制或换手上限生效，但执行了部分调仓 | `StatusSuboptimal` | 闭合到 1，逐笔 `>= band`，换手不超上限 | `DiagNoTradeZone` / `DiagTurnoverCapped` |
+| 抑制后只剩单侧交易（无法闭合）、上限小到无法容纳 `2×band` 的最小往返换手、全部低于阈值，或成本/收益闸门放弃 | `StatusOptimal` | 交易全为 0，新权重逐位等于当前权重（和为 1） | `DiagRebalanceAbandoned`（闸门同时带 `DiagNoTradeZone`） |
+| 返回结果未通过闭合/约束自检 | `StatusInfeasible` + error | 不返回无效权重，回退当前权重并给出可区分原因 | `DiagUnstable` 说明违规项 |
+| 非法输入 | `StatusInvalidInput` + error | 不计算交易 | `Reason` 区分具体原因 |
+
+`Reason` 以自然语言说明：哪些资产因阈值保持当前权重、哪一侧被裁剪及裁剪
+比例、换手上限如何缩放、实际换手与成本如何计算，以及是部分执行还是完全
+放弃；说明与返回数值始终一致。
+
+### 输入校验
+
+以下输入被明确拒绝（`StatusInvalidInput` + 可区分的 error 与 `Reason`）：
+`Current`/`Target` 为空或长度不一致；含 NaN/±Inf；权重和在容差内不等于 1；
+`NoTradeBand`、`MaxTurnover`、`MinBenefit`、成本率为负或非有限；估计量
+`Mu`/`Cov` 维度不符、非方阵或含非有限值。
+
+### 统一出口校验
+
+所有返回路径（成功、部分执行、各类放弃）都经过同一组最终检查：权重和 = 1、
+交易和 = 0、逐笔权重一致 `new = current + trade`、权重在 [0,1]、每笔非零
+交易不低于 `NoTradeBand`、交易方向指向目标且不越过目标、报告换手与实际
+一致且不超过 `MaxTurnover`、结果均为有限值。任何违规都转为
+`StatusInfeasible` + 明确 error，绝不静默返回无效结果。
 
 ## 稳健性诊断
 
@@ -122,7 +165,9 @@ rb, _ := portfolio.Rebalance(ctx, portfolio.RebalanceRequest{
 
 `DiagMissingData`、`DiagOutliersWinsorized`、`DiagHighDimensional`
 （资产数 > 样本数）、`DiagShrinkageApplied`、`DiagEigenvalueClipped`、
-`DiagNearSingular`、`DiagTurnoverCapped`、`DiagNoTradeZone`、`DiagUnstable`。
+`DiagNearSingular`、`DiagTurnoverCapped`、`DiagNoTradeZone`、
+`DiagRebalanceAbandoned`（再平衡完全放弃、零交易、保留当前权重）、
+`DiagUnstable`。
 
 ## 测试
 
@@ -132,4 +177,6 @@ go test -race ./...  # 并发竞争检测
 ```
 
 覆盖：约束边界、奇异/近奇异协方差、缺失与异常值、n>p、换手率上限、
-逐位确定性、并发安全（-race）、参数扰动稳定性。
+最小调仓阈值抑制与重配平（单边/多边同向与反向/全部抑制）、阈值与换手上限
+叠加、成本收益闸门放弃、所有再平衡返回路径的权重和与约束校验、非法输入
+可区分拒绝、并发再平衡无相互污染、逐位确定性（-race）、参数扰动稳定性。
